@@ -166,9 +166,10 @@ sub cmd_install {
             $master->add_distribution($_) for $self->load_snapshot($self->{snapshot});
         } elsif (-f $self->{cpanfile}) {
             warn "Loading modules from $self->{cpanfile}...\n";
-            my $requirements = $self->load_cpanfile($self->{cpanfile});
+            my ($requirements, $dists) = $self->load_cpanfile($self->{cpanfile});
+            $master->add_distribution($_) for @$dists;
             my ($is_satisfied, @need_resolve) = $master->is_satisfied($requirements);
-            if ($is_satisfied) {
+            if ($is_satisfied && !@$dists) {
                 warn "All requirements are satisfied.\n";
                 return 0; # exit 0
             } elsif (!defined $is_satisfied) {
@@ -218,12 +219,24 @@ sub load_cpanfile {
     my ($self, $file) = @_;
     require Module::CPANfile;
     my $cpanfile = Module::CPANfile->load($file);
-    my @package;
+    my (@package, @distributions);
     for my $package ($cpanfile->merged_requirements->required_modules) {
-        my $version =$cpanfile->prereq_for_module($package)->requirement->version;
-        push @package, { package => $package, version => $version };
+        my $req = $cpanfile->prereq_for_module($package)->requirement;
+        if ($req->has_options) {
+            my $options = $req->options;
+            if ($options->{git} || $options->{dist}) {
+                my $distfile = $options->{dist}
+                             || ($options->{git} . ($options->{ref} ? "\@$options->{ref}" : ""));
+                push @distributions, App::cpm::Distribution->new(
+                    distfile => $distfile,
+                    provides => [{ package => $package }],
+                );
+            }
+        } else {
+            push @package, { package => $package, version => $req->version };
+        }
     }
-    \@package;
+    (\@package, \@distributions);
 }
 
 sub load_snapshot {
