@@ -233,6 +233,23 @@ sub _calculate_jobs {
             push @phase, 'configure' if $dist->prebuilt;
             my $dist_requirements = $dist->requirements(\@phase)->as_array;
             my ($is_satisfied, @need_resolve) = $self->is_satisfied($dist_requirements);
+
+            # if all deps are resolved and seen, but still not installed
+            # then check if there are circular dependencies that are satisfied
+            if (
+                   defined $is_satisfied
+                && ! $is_satisfied
+                && ! @need_resolve
+            ) {
+                my ($is_satisfied_circular, @circular_deps) = $self->is_satisfied_circular_deps(\@phase, $dist);
+                if ($is_satisfied_circular) {
+                    my $msg = sprintf "Detected circular dependencies %s -> %s",
+                        $dist->distvname,join(', ', map { $_->distvname } @circular_deps);
+                    $self->{logger}->log($msg);
+                    $is_satisfied = 1;
+                }
+            }
+
             if ($is_satisfied) {
                 $dist->registered(1);
                 $self->add_job(
@@ -282,6 +299,43 @@ sub _register_resolve_job {
         );
     }
     return $ok;
+}
+
+sub is_satisfied_circular_deps {
+    my ($self, $phases, $dist, $seen) = @_;
+    $seen ||= {};
+    $seen->{ $_->{package} } = $dist for @{ $dist->provides || [] };
+
+    # gather all circular deps
+    my %uninstalled   = ();
+    my @distributions = $self->distributions;
+    my $requirements  = $dist->requirements($phases)->as_array;
+    for my $req (@$requirements) {
+        my ($package, $version_range) = @{$req}{qw(package version_range)};
+        next if $package eq "perl";
+        # skip circular deps that have already been seen
+        next if $seen->{$package} && $seen->{$package}->providing($package, $version_range);
+        next if $self->is_installed($package, $version_range);
+
+        my ($resolved) = grep { $_->providing($package, $version_range) } @distributions;
+        return if ! $resolved || ! $resolved->configured;
+        next   if $resolved->installed;
+        $uninstalled{$package} = $resolved;
+    }
+
+    # check that all circular deps are also satisfied
+    my @satisfied;
+    for my $package (sort keys %uninstalled) {
+        my $dist = $uninstalled{$package};
+        # skip packages from dists already seen
+        next if grep { $_->distfile eq $dist->distfile } values %$seen;
+
+        my ($is_satisfied) = $self->is_satisfied_circular_deps($phases, $dist, $seen);
+        return if ! $is_satisfied;
+        push @satisfied, $dist;
+    }
+
+    return 1, @satisfied;
 }
 
 sub is_satisfied_perl_version {
