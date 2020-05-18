@@ -6,6 +6,7 @@ use App::cpm::CircularDependency;
 use App::cpm::Distribution;
 use App::cpm::Job;
 use App::cpm::Logger;
+use App::cpm::Requirement;
 use App::cpm::version;
 use CPAN::DistnameInfo;
 use IO::Handle;
@@ -18,6 +19,7 @@ sub new {
         installed_distributions => 0,
         jobs => +{},
         distributions => +{},
+        requirements  => App::cpm::Requirement->new,
         _fail_resolve => +{},
         _fail_install => +{},
         _is_installed => +{},
@@ -109,6 +111,33 @@ sub get_job {
     return;
 }
 
+sub register_requirements {
+    my ($self, $requirements) = @_;
+    my $wantarray  = wantarray;
+    my $registered = $self->{requirements};
+    my %packages   = map { ($_->{package}, $_->{version_range}) } @$requirements;
+    if ($registered->add(%packages)) {
+        my @found = map { $registered->has($_->{package}) } @$requirements;
+        return $wantarray ? @found : 1;
+    } else {
+        return;
+    }
+}
+
+sub unsatisfied_registered_requirements {
+    my ($self, $provides) = @_;
+    my $registered        = $self->{requirements};
+
+    my @unsatisfied;
+    for my $package (@$provides) {
+        my $requirement = $registered->has($package->{package}) or next;
+        my $version     = App::cpm::version->parse($package->{version});
+        push @unsatisfied, $requirement if ! $version->satisfy($requirement->{version_range});
+    }
+
+    return @unsatisfied;
+}
+
 sub register_result {
     my ($self, $result) = @_;
     my ($job) = grep { $_->uid eq $result->{uid} } $self->jobs;
@@ -195,6 +224,15 @@ sub _calculate_jobs {
         for my $dist (@dists) {
             local $self->{logger}->{context} = $dist->distvname;
             my $dist_requirements = $dist->requirements('configure')->as_array;
+            if (!$self->register_requirements($dist_requirements)) {
+                my $msg = sprintf "%s has conflicting requirements: %s",
+                    $dist->distvname, $@;
+                $self->{logger}->log($msg);
+                App::cpm::Logger->log(result => "FAIL", message => $msg);
+                $self->{_fail_install}{$dist->distfile}++;
+                next;
+            }
+
             my ($is_satisfied, @need_resolve) = $self->is_satisfied($dist_requirements);
             if ($is_satisfied) {
                 $dist->registered(1);
@@ -232,8 +270,16 @@ sub _calculate_jobs {
             my @phase = qw(build test runtime);
             push @phase, 'configure' if $dist->prebuilt;
             my $dist_requirements = $dist->requirements(\@phase)->as_array;
-            my ($is_satisfied, @need_resolve) = $self->is_satisfied($dist_requirements);
+            if (!$self->register_requirements($dist_requirements)) {
+                my $msg = sprintf "%s has conflicting requirements: %s",
+                    $dist->distvname, $@;
+                $self->{logger}->log($msg);
+                App::cpm::Logger->log(result => "FAIL", message => $msg);
+                $self->{_fail_install}{$dist->distfile}++;
+                next;
+            }
 
+            my ($is_satisfied, @need_resolve) = $self->is_satisfied($dist_requirements);
             # if all deps are resolved and seen, but still not installed
             # then check if there are circular dependencies that are satisfied
             if (
@@ -292,10 +338,25 @@ sub _register_resolve_job {
             next;
         }
 
+        my ($registered) = $self->register_requirements([{
+            package => $package->{package}, version_range => $package->{version_range}}]);
+        if (!$registered) {
+            my $message = "Cannot resolve $package->{package} $package->{version_range}: $@";
+            $self->{logger}->log($message);
+            App::cpm::Logger->log(
+                result => "FAIL",
+                type => "install",
+                message => $message,
+            );
+            $self->{_fail_install}{$package->{package}}++;
+            $ok = 0;
+            next;
+        }
+
         $self->add_job(
             type => "resolve",
             package => $package->{package},
-            version_range => $package->{version_range},
+            version_range => $registered->{version_range},
         );
     }
     return $ok;
@@ -318,7 +379,8 @@ sub is_satisfied_circular_deps {
         next if $self->is_installed($package, $version_range);
 
         my ($resolved) = grep { $_->providing($package, $version_range) } @distributions;
-        return if ! $resolved || ! $resolved->configured;
+        # bail unless deps are configured and haven't already failed
+        return if ! $resolved || ! $resolved->configured || $self->{_fail_install}{$resolved->distfile};
         next   if $resolved->installed;
         $uninstalled{$package} = $resolved;
     }
@@ -505,6 +567,16 @@ sub _register_fetch_result {
         local $self->{logger}{context} = $distribution->distvname;
         my $msg = join ", ", map { sprintf "%s (%s)", $_->{package}, $_->{version} || 0 } @{$distribution->provides};
         $self->{logger}->log("Distribution provides: $msg");
+
+        if (my @unsatisfied = $self->unsatisfied_registered_requirements($distribution->provides) ) {
+            my $msg = sprintf "%s conflicts with requirements: %s",
+                $distribution->distvname,
+                join(", ", map { sprintf "%s (%s)", $_->{package}, $_->{version_range} } @unsatisfied);
+            $self->{logger}->log($msg);
+            App::cpm::Logger->log(result => "FAIL", message => $msg);
+            $self->{_fail_install}{$distribution->distfile}++;
+            return;
+        }
     } else {
         $distribution->fetched(1);
         $distribution->requirements($_ => $job->{requirements}{$_}) for keys %{$job->{requirements}};
@@ -532,6 +604,16 @@ sub _register_configure_result {
     local $self->{logger}{context} = $distribution->distvname;
     my $msg = join ", ", map { sprintf "%s (%s)", $_->{package}, $_->{version} || 0 } @{$distribution->provides};
     $self->{logger}->log("Distribution provides: $msg");
+
+    if (my @unsatisfied = $self->unsatisfied_registered_requirements(\@provide) ) {
+        my $msg = sprintf "%s conflicts with requirements: %s",
+            $distribution->distvname,
+            join(", ", map { sprintf "%s (%s)", $_->{package}, $_->{version_range} } @unsatisfied);
+        $self->{logger}->log($msg);
+        App::cpm::Logger->log(result => "FAIL", message => $msg);
+        $self->{_fail_install}{$distribution->distfile}++;
+        return;
+    }
 
     return 1;
 }

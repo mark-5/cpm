@@ -248,9 +248,10 @@ sub cmd_install {
         (exists $self->{target_perl} ? (target_perl => $self->{target_perl}) : ()),
     );
 
-    my ($packages, $dists, $resolver) = $self->initial_job($master);
+    my ($packages, $dists, $resolver, $requirements) = $self->initial_job($master);
     return 0 unless $packages;
 
+    $master->register_requirements($requirements) if $requirements;
     my $worker = App::cpm::Worker->new(
         verbose   => $self->{verbose},
         home      => $self->{home},
@@ -384,22 +385,22 @@ sub cleanup {
 sub initial_job {
     my ($self, $master) = @_;
 
-    my (@package, @dist, $resolver);
+    my (@package, @dist, $resolver, $requirements);
 
     if (!@{$self->{argv}}) {
-        my ($requirement, $reinstall);
-        ($requirement, $reinstall, $resolver) = $self->load_cpanfile($self->{cpanfile});
-        my ($is_satisfied, @need_resolve) = $master->is_satisfied($requirement);
+        my $reinstall;
+        ($requirements, $reinstall, $resolver) = $self->load_cpanfile($self->{cpanfile});
+        my ($is_satisfied, @need_resolve) = $master->is_satisfied($requirements);
         if (!@$reinstall and $is_satisfied) {
             warn "All requirements are satisfied.\n";
             return;
         } elsif (!defined $is_satisfied) {
-            my ($req) = grep { $_->{package} eq "perl" } @$requirement;
+            my ($req) = grep { $_->{package} eq "perl" } @$requirements;
             die sprintf "%s requires perl %s, but you have only %s\n",
                 $self->{cpanfile}, $req->{version_range}, $self->{target_perl} || $];
         }
         push @package, @need_resolve, @$reinstall;
-        return (\@package, \@dist, $resolver);
+        return (\@package, \@dist, $resolver, $requirements);
     }
 
     $self->{mirror} ||= $self->{_default_mirror};
@@ -453,7 +454,7 @@ sub initial_job {
         push @dist, $dist if $dist;
     }
 
-    return (\@package, \@dist, $resolver);
+    return (\@package, \@dist, $resolver, $requirements);
 }
 
 sub load_cpanfile {
